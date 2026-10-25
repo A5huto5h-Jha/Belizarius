@@ -1,10 +1,23 @@
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import belizariusImage from './assets/belizarius.jpg'
 import './App.css'
 
+type Mood = 'IDLE' | 'LISTENING' | 'THINKING'
+
 function App() {
-  const [mood, setMood] = useState('IDLE')
+  const [mood, setMood] = useState<Mood>('IDLE')
+  const [wakePhrase, setWakePhrase] = useState('')
+
+  useEffect(() => {
+    const unsubscribe = window.electronAPI.onWakeWord((phrase) => {
+      console.log('Belizarius activated:', phrase)
+      setWakePhrase(phrase)
+      setMood('LISTENING')
+    })
+
+    return unsubscribe
+  }, [])
 
   return (
     <main className="companion">
@@ -20,6 +33,12 @@ function App() {
       <section className="companion-ui">
         <div className="name">BELIZARIUS</div>
         <div className="status">{mood}</div>
+
+        {wakePhrase && (
+          <div className="wake-phrase">
+            Activated: {wakePhrase}
+          </div>
+        )}
 
         <div className="controls">
           <button onClick={() => setMood('LISTENING')}>

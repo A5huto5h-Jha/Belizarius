@@ -1,22 +1,22 @@
 "use strict";
 const electron = require("electron");
-electron.contextBridge.exposeInMainWorld("ipcRenderer", {
-  on(...args) {
-    const [channel, listener] = args;
-    return electron.ipcRenderer.on(channel, (event, ...args2) => listener(event, ...args2));
+electron.contextBridge.exposeInMainWorld("electronAPI", {
+  onWakeWord: (callback) => {
+    const listener = (_event, phrase) => {
+      callback(phrase);
+    };
+    electron.ipcRenderer.on("voice:wake-word", listener);
+    return () => {
+      electron.ipcRenderer.removeListener("voice:wake-word", listener);
+    };
   },
-  off(...args) {
-    const [channel, ...omit] = args;
-    return electron.ipcRenderer.off(channel, ...omit);
-  },
-  send(...args) {
-    const [channel, ...omit] = args;
-    return electron.ipcRenderer.send(channel, ...omit);
-  },
-  invoke(...args) {
-    const [channel, ...omit] = args;
-    return electron.ipcRenderer.invoke(channel, ...omit);
+  onMainProcessMessage: (callback) => {
+    const listener = (_event, message) => {
+      callback(message);
+    };
+    electron.ipcRenderer.on("main-process-message", listener);
+    return () => {
+      electron.ipcRenderer.removeListener("main-process-message", listener);
+    };
   }
-  // You can expose other APTs you need here.
-  // ...
 });
