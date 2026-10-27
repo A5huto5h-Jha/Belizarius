@@ -1,28 +1,44 @@
-﻿import queue
+﻿
+import queue
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 import sherpa_onnx
+from scipy.signal import resample_poly
 
 ROOT = Path(__file__).resolve().parent
 MODEL = ROOT / "models" / "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 
-SAMPLE_RATE = 16000
-DEVICE_ID = 1
-BLOCK_SIZE = 1600
+SAMPLE_RATE = 16000          # Rate expected by the keyword detector
+DEVICE_RATE = 48000          # Native rate supported by the tested microphone
+DEVICE_ID = 15               # AMD Audio Device (WASAPI)
+BLOCK_SIZE = 4800            # 100 ms at 48 kHz
 
-audio_queue = queue.Queue()
+audio_queue = queue.Queue(maxsize=30)
 
 
 def audio_callback(indata, frames, time_info, status):
     if status:
-        print(f"Audio status: {status}")
-    audio_queue.put(bytes(indata))
+        print(f"Audio status: {status}", flush=True)
+
+    try:
+        audio_queue.put_nowait(bytes(indata))
+    except queue.Full:
+        # Drop the oldest block to keep wake detection responsive.
+        try:
+            audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            audio_queue.put_nowait(bytes(indata))
+        except queue.Full:
+            pass
 
 
 def main():
-    print("Loading Belizarius keyword detector...")
+    print("Loading Belizarius keyword detector...", flush=True)
 
     kws = sherpa_onnx.KeywordSpotter(
         tokens=str(MODEL / "tokens.txt"),
@@ -38,12 +54,13 @@ def main():
 
     stream = kws.create_stream()
 
-    print("Loaded. Say: Hey Belizarius")
-    print("Press Ctrl+C to stop.\n")
+    print("Loaded. Say: Hey Belizarius", flush=True)
+    print("Microphone: AMD Audio Device at 48000 Hz", flush=True)
+    print("Press Ctrl+C to stop.\n", flush=True)
 
     try:
         with sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
+            samplerate=DEVICE_RATE,
             blocksize=BLOCK_SIZE,
             device=DEVICE_ID,
             dtype="int16",
@@ -52,9 +69,17 @@ def main():
         ):
             while True:
                 data = audio_queue.get()
-                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                samples = (
+                    np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                    / 32768.0
+                )
 
-                stream.accept_waveform(SAMPLE_RATE, samples)
+                # Convert 48 kHz microphone audio to the detector's 16 kHz input.
+                samples_16k = resample_poly(samples, up=1, down=3).astype(
+                    np.float32
+                )
+
+                stream.accept_waveform(SAMPLE_RATE, samples_16k)
 
                 while kws.is_ready(stream):
                     kws.decode_stream(stream)
@@ -65,7 +90,7 @@ def main():
                         kws.reset_stream(stream)
 
     except KeyboardInterrupt:
-        print("\nBelizarius test stopped.")
+        print("\nBelizarius test stopped.", flush=True)
 
 
 if __name__ == "__main__":

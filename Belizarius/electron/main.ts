@@ -1,7 +1,13 @@
-import { app, BrowserWindow } from 'electron'
+
+import { app, BrowserWindow, ipcMain } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import type {
+  ActivityEvent,
+  BelizariusStatus,
+  VisibilityMode,
+} from '../src/shared-types'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -16,9 +22,47 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
   : RENDERER_DIST
 
 let win: BrowserWindow | null = null
-let voiceProcess: ChildProcess | null = null
+let listenerProcess: ChildProcess | null = null
+let conversationProcess: ChildProcess | null = null
+
+let quitting = false
+let conversationRequested = false
+let visibilityMode: VisibilityMode = 'TRANSPARENCY'
+let pendingWakePhrase: string | null = null
+let nextActivityId = 1
+
+function send(channel: string, ...args: unknown[]) {
+  if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+    win.webContents.send(channel, ...args)
+  }
+}
+
+function setStatus(status: BelizariusStatus) {
+  send('voice:status', status)
+}
+
+function activity(
+  action: string,
+  status: ActivityEvent['status'],
+  details?: string,
+) {
+  const event: ActivityEvent = {
+    id: String(nextActivityId++),
+    action,
+    status,
+    details,
+    timestamp: Date.now(),
+  }
+
+  send('activity:event', event)
+}
 
 function createWindow() {
+  if (win && !win.isDestroyed()) {
+    win.show()
+    return
+  }
+
   win = new BrowserWindow({
     width: 300,
     height: 300,
@@ -35,13 +79,18 @@ function createWindow() {
   })
 
   win.webContents.on('did-finish-load', () => {
-    win?.webContents.send('main-process-message', new Date().toLocaleString())
+    send('main-process-message', new Date().toLocaleString())
+
+    if (pendingWakePhrase) {
+      send('voice:wake-word', pendingWakePhrase)
+      pendingWakePhrase = null
+    }
   })
 
   if (VITE_DEV_SERVER_URL) {
-    win.loadURL(VITE_DEV_SERVER_URL)
+    void win.loadURL(VITE_DEV_SERVER_URL)
   } else {
-    win.loadFile(path.join(RENDERER_DIST, 'index.html'))
+    void win.loadFile(path.join(RENDERER_DIST, 'index.html'))
   }
 
   win.on('closed', () => {
@@ -49,78 +98,238 @@ function createWindow() {
   })
 }
 
-function startVoiceListener() {
-  console.log('[Belizarius] Attempting to start Python...')
-  console.log('[Belizarius] App path:', app.getAppPath())
-  if (voiceProcess && voiceProcess.exitCode === null && !voiceProcess.killed) {
+function pythonPaths() {
+  const root = app.getAppPath()
+
+  return {
+    python: path.join(
+      root,
+      'voice_engine',
+      '.venv',
+      'Scripts',
+      'python.exe',
+    ),
+    listener: path.join(root, 'voice_engine', 'wake_sherpa.py'),
+    conversation: path.join(root, 'voice_engine', 'conversation.py'),
+    root,
+  }
+}
+
+function startListener() {
+  if (quitting || conversationRequested || conversationProcess) return
+  if (listenerProcess) return
+
+  const paths = pythonPaths()
+  console.log('[Belizarius] Starting wake listener:', paths.listener)
+
+  let child: ChildProcess
+
+  try {
+    child = spawn(paths.python, ['-u', paths.listener], {
+      cwd: paths.root,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    console.error('[Belizarius] Could not start wake listener:', error)
+    setStatus('ERROR')
     return
   }
 
-  // Development path. Packaging needs a separate Python/model deployment setup.
-  const projectRoot = app.getAppPath()
-  const pythonPath = path.join(
-    projectRoot, 'voice_engine', '.venv', 'Scripts', 'python.exe'
-  )
-  const listenerPath = path.join(
-    projectRoot, 'voice_engine', 'wake_sherpa.py'
-  )
-  console.log('[Belizarius] Python path:', pythonPath)
-  console.log('[Belizarius] Listener path:', listenerPath)
-  voiceProcess = spawn(pythonPath, ['-u', listenerPath], {
-    cwd: projectRoot,
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  listenerProcess = child
+  let buffer = ''
 
-  let stdoutBuffer = ''
-
-  voiceProcess.stdout?.on('data', (data: Buffer) => {
-    stdoutBuffer += data.toString()
-    const lines = stdoutBuffer.split(/\r?\n/)
-    stdoutBuffer = lines.pop() ?? ''
+  child.stdout?.on('data', (data: Buffer) => {
+    buffer += data.toString()
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() ?? ''
 
     for (const line of lines) {
+      if (!line.trim()) continue
+
       if (line.startsWith('WAKE_WORD:')) {
-        createWindow()
         const phrase = line.slice('WAKE_WORD:'.length).trim()
-        win?.webContents.send('voice:wake-word', phrase)
-      } else if (line.trim()) {
-        console.log('[Voice engine]', line)
+
+        if (conversationRequested || conversationProcess || quitting) continue
+
+        console.log('[Belizarius] Wake word detected:', phrase)
+        conversationRequested = true
+        pendingWakePhrase = phrase
+        createWindow()
+        setStatus('THINKING')
+
+        // Let the listener process exit before opening the same microphone.
+        stopListener()
+      } else {
+        console.log('[Wake listener]', line)
       }
     }
   })
 
-  voiceProcess.stderr?.on('data', (data: Buffer) => {
-    console.error('[Voice engine]', data.toString())
+  child.stderr?.on('data', (data: Buffer) => {
+    console.error('[Wake listener]', data.toString())
   })
 
-  voiceProcess.on('error', (error) => {
-    console.error('[Voice engine failed to start]', error)
+  child.on('error', (error) => {
+    console.error('[Belizarius] Wake listener failed:', error)
+    if (listenerProcess === child) listenerProcess = null
+    setStatus('ERROR')
   })
 
-  voiceProcess.on('exit', (code) => {
-    console.log('[Belizarius] Python exit code:', code)
-    console.log('[Voice engine exited]', code)
-    voiceProcess = null
+  child.on('exit', (code) => {
+    console.log('[Belizarius] Wake listener exit code:', code)
+
+    if (listenerProcess === child) listenerProcess = null
+
+    if (quitting) return
+
+    if (conversationRequested && !conversationProcess) {
+      startConversation()
+    } else if (!conversationRequested) {
+      // Retry a listener that stopped unexpectedly.
+      setTimeout(startListener, 1000)
+    }
   })
 }
 
-function stopVoiceListener() {
-  if (voiceProcess) {
-    voiceProcess.kill()
-    voiceProcess = null
+function stopListener() {
+  if (listenerProcess && listenerProcess.exitCode === null) {
+    listenerProcess.kill()
   }
 }
 
-app.whenReady().then(() => {
-  console.log('[Belizarius] Electron main process is running')
-  
-  startVoiceListener()
+function startConversation() {
+  if (quitting || conversationProcess) return
+
+  const paths = pythonPaths()
+  console.log('[Belizarius] Starting Gemini conversation:', paths.conversation)
+  activity('Voice conversation', 'started')
+  setStatus('THINKING')
+
+  let child: ChildProcess
+
+  try {
+    child = spawn(paths.python, ['-u', paths.conversation], {
+      cwd: paths.root,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    console.error('[Belizarius] Could not start conversation:', error)
+    conversationRequested = false
+    setStatus('ERROR')
+    activity('Voice conversation', 'failed', String(error))
+    startListener()
+    return
+  }
+
+  conversationProcess = child
+  let buffer = ''
+
+  child.stdout?.on('data', (data: Buffer) => {
+    buffer += data.toString()
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() ?? ''
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+
+      console.log('[Conversation]', trimmed)
+
+      if (trimmed === 'CONNECTING_TO_GEMINI') {
+        setStatus('THINKING')
+      } else if (trimmed === 'GEMINI_CONNECTED' ||
+                 trimmed.startsWith('MICROPHONE_READY')) {
+        setStatus('LISTENING')
+      } else if (trimmed.startsWith('YOU SAID:')) {
+        send('voice:input', trimmed.slice('YOU SAID:'.length).trim())
+        setStatus('THINKING')
+      } else if (trimmed.startsWith('BELIZARIUS:')) {
+        send('voice:output', trimmed.slice('BELIZARIUS:'.length).trim())
+        setStatus('SPEAKING')
+      } else if (trimmed === 'TURN_COMPLETE') {
+        setStatus('LISTENING')
+      } else if (trimmed.startsWith('ERROR:')) {
+        setStatus('ERROR')
+        activity('Voice conversation', 'failed', trimmed.slice(6).trim())
+      }
+    }
+  })
+
+  child.stderr?.on('data', (data: Buffer) => {
+    console.error('[Conversation error]', data.toString())
+  })
+
+  child.on('error', (error) => {
+    console.error('[Belizarius] Conversation process failed:', error)
+    setStatus('ERROR')
+    activity('Voice conversation', 'failed', String(error))
+  })
+
+  child.on('exit', (code) => {
+    console.log('[Belizarius] Conversation exit code:', code)
+
+    if (conversationProcess === child) conversationProcess = null
+
+    if (quitting) return
+
+    if (code === 0) {
+      activity('Voice conversation', 'completed')
+      setStatus('IDLE')
+    } else {
+      activity('Voice conversation', 'failed', `Process exited with code ${code}`)
+      setStatus('ERROR')
+    }
+
+    conversationRequested = false
+    pendingWakePhrase = null
+    startListener()
+  })
+}
+
+ipcMain.handle('ui:set-visibility-mode', (_event, mode: VisibilityMode) => {
+  if (mode !== 'STEALTH' && mode !== 'TRANSPARENCY') {
+    throw new Error('Invalid visibility mode')
+  }
+
+  visibilityMode = mode
+
+  if (win && !win.isDestroyed()) {
+    if (mode === 'STEALTH') {
+      win.setOpacity(0.85)
+    } else {
+      win.setOpacity(1)
+    }
+  }
+
+  console.log('[Belizarius] Visibility mode:', visibilityMode)
 })
 
-app.on('before-quit', stopVoiceListener)
+ipcMain.handle('voice:stop-conversation', () => {
+  conversationRequested = false
+
+  if (conversationProcess && conversationProcess.exitCode === null) {
+    conversationProcess.kill()
+  } else if (!listenerProcess) {
+    startListener()
+  }
+})
+
+app.whenReady().then(() => {
+  console.log('[Belizarius] Electron main process is running')
+  startListener()
+})
+
+app.on('before-quit', () => {
+  quitting = true
+  stopListener()
+
+  if (conversationProcess && conversationProcess.exitCode === null) {
+    conversationProcess.kill()
+  }
+})
 
 app.on('window-all-closed', () => {
-  // Keep normal Electron platform behavior; Windows closes the app.
   if (process.platform !== 'darwin') app.quit()
 })

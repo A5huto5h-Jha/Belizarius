@@ -178,10 +178,33 @@ async def main():
                     receive_gemini_audio(session)
                 )
 
+                
                 done, pending = await asyncio.wait(
                     [sender, receiver],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+
+                for task in done:
+                    if task.cancelled():
+                        log(f"DEBUG_TASK_CANCELLED: {task.get_name()}")
+                    else:
+                        error = task.exception()
+                        log(f"DEBUG_TASK_FINISHED: {task.get_name()}")
+                        if error:
+                            log(f"DEBUG_TASK_ERROR: {type(error).__name__}: {error}")
+
+                running = False
+
+                for task in pending:
+                    task.cancel()
+
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                for task in done:
+                    error = task.exception()
+                    if error:
+                        raise error
+
 
                 running = False
 
