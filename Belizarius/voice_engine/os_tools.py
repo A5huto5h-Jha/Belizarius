@@ -1,171 +1,106 @@
-
+"""Safe desktop tools for Belizarius (Windows-oriented)."""
 import os
-import shutil
-import subprocess
+import re
 import webbrowser
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
-import ctypes
-from ctypes import POINTER, cast
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-
-
-# Restrict file operations to these locations.
-HOME = Path.home()
-ALLOWED_ROOTS = [
-    HOME / "Desktop",
-    HOME / "Documents",
-    HOME / "Downloads",
-    HOME / "Music",
-    HOME / "Videos",
-]
-
-# Add your project folder explicitly if you want it accessible.
-PROJECT_ROOT = Path(r"A:\Belizarius\Belizarius")
-ALLOWED_ROOTS.append(PROJECT_ROOT)
+WORKSPACE = Path(__file__).resolve().parent.parent / "Belizarius_Workspace"
+WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 
-def resolve_allowed_path(path: str) -> Path:
-    """Resolve a path and ensure it stays within an allowed directory."""
-    target = Path(path).expanduser().resolve()
+def safe_path(name: str) -> Path:
+    """Resolve a relative path and confine it to Belizarius_Workspace."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("A non-empty relative file path is required.")
 
-    for root in ALLOWED_ROOTS:
-        root = root.resolve()
-        try:
-            target.relative_to(root)
-            return target
-        except ValueError:
-            continue
+    candidate = Path(name)
+    if candidate.is_absolute():
+        raise ValueError("Use a relative path inside Belizarius_Workspace.")
 
-    raise PermissionError(f"Path is outside allowed locations: {target}")
-
-
-def create_directory(path: str) -> str:
-    target = resolve_allowed_path(path)
-    target.mkdir(parents=True, exist_ok=False)
-    return f"Created directory: {target}"
+    target = (WORKSPACE / candidate).resolve()
+    root = WORKSPACE.resolve()
+    if target != root and root not in target.parents:
+        raise PermissionError("Access denied: path is outside Belizarius_Workspace.")
+    return target
 
 
-def create_text_file(path: str, content: str = "") -> str:
-    target = resolve_allowed_path(path)
+def create_file(name: str, content: str = "") -> str:
+    target = safe_path(name)
+    if target.exists():
+        raise FileExistsError(f"{name} already exists; ask before overwriting it.")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return f"Created text file: {target}"
 
 
-def list_directory(path: str) -> str:
-    target = resolve_allowed_path(path)
-    if not target.is_dir():
-        raise NotADirectoryError(str(target))
-
-    entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    if not entries:
-        return "The directory is empty."
-
-    return "\n".join(
-        f"{'[DIR]' if p.is_dir() else '[FILE]'} {p.name}"
-        for p in entries[:100]
-    )
-
-
-def read_text_file(path: str) -> str:
-    target = resolve_allowed_path(path)
+def read_file(name: str) -> str:
+    target = safe_path(name)
     if not target.is_file():
-        raise FileNotFoundError(str(target))
-
+        raise FileNotFoundError(f"File not found: {name}")
     if target.stat().st_size > 1_000_000:
         raise ValueError("File is too large to read (limit: 1 MB).")
-
-    return target.read_text(encoding="utf-8")[:12000]
-
-
-def rename_path(path: str, new_name: str) -> str:
-    target = resolve_allowed_path(path)
-
-    if not target.exists():
-        raise FileNotFoundError(str(target))
-
-    if Path(new_name).name != new_name or new_name in {".", ".."}:
-        raise ValueError("Provide only a new filename, not a path.")
-
-    destination = resolve_allowed_path(str(target.parent / new_name))
-    if destination.exists():
-        raise FileExistsError(str(destination))
-
-    target.rename(destination)
-    return f"Renamed to: {destination}"
+    return target.read_text(encoding="utf-8")[:20000]
 
 
-def move_path(source: str, destination_folder: str) -> str:
-    src = resolve_allowed_path(source)
-    dst_folder = resolve_allowed_path(destination_folder)
-
-    if not src.exists():
-        raise FileNotFoundError(str(src))
-    if not dst_folder.is_dir():
-        raise NotADirectoryError(str(dst_folder))
-
-    dst = resolve_allowed_path(str(dst_folder / src.name))
-    if dst.exists():
-        raise FileExistsError(str(dst))
-
-    shutil.move(str(src), str(dst))
-    return f"Moved to: {dst}"
+def write_file(name: str, content: str) -> str:
+    target = safe_path(name)
+    if not target.is_file():
+        raise FileNotFoundError(f"File not found: {name}. Use create_file first.")
+    target.write_text(content, encoding="utf-8")
+    return f"Updated text file: {target}"
 
 
-def delete_path(path: str, confirmed: bool = False) -> str:
-    if not confirmed:
-        return (
-            "CONFIRMATION_REQUIRED: Ask the user to confirm deletion "
-            f"of {path!r} before calling this function again with confirmed=True."
-        )
-
-    target = resolve_allowed_path(path)
-
-    if not target.exists():
-        raise FileNotFoundError(str(target))
-
-    if target.is_dir():
-        shutil.rmtree(target)
-    else:
-        target.unlink()
-
-    return f"Deleted: {target}"
-
-
-def open_path(path: str) -> str:
-    target = resolve_allowed_path(path)
-
-    if not target.exists():
-        raise FileNotFoundError(str(target))
-
+def open_file(name: str) -> str:
+    target = safe_path(name)
+    if not target.is_file():
+        raise FileNotFoundError(f"File not found: {name}")
+    if not hasattr(os, "startfile"):
+        raise OSError("Opening files with the default application is supported on Windows.")
     os.startfile(str(target))
-    return f"Opened: {target}"
+    return f"Opened file: {target}"
 
 
 def open_website(url: str) -> str:
-    if not url.startswith(("https://", "http://")):
-        raise ValueError("Only HTTP and HTTPS URLs are allowed.")
-
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only complete HTTP or HTTPS website URLs are allowed.")
     webbrowser.open(url)
-    return f"Opened website: {url}"
+    return f"Opened website in the default browser: {url}"
 
 
 def play_youtube(query: str) -> str:
     from urllib.parse import quote_plus
 
-    url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
+    if not query or not query.strip():
+        raise ValueError("Please provide a song, artist, or music search.")
+    search_query = query.strip()
+    url = "https://www.youtube.com/results?search_query=" + quote_plus(search_query)
     webbrowser.open(url)
-    return f"Opened YouTube search for: {query}"
+    return f"Opened YouTube search results for: {search_query}. Select a result to start playback."
 
 
-def set_system_volume(level: int) -> str:
-    if not 0 <= level <= 100:
-        raise ValueError("Volume must be between 0 and 100.")
+def compose_email(recipient_email: str, subject: str, body: str) -> str:
+    """Open a draft only; never sends mail."""
+    recipient = recipient_email.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient):
+        raise ValueError("That does not look like a valid email address.")
+    if not subject.strip():
+        raise ValueError("Email subject cannot be empty.")
 
-    devices = AudioUtilities.GetSpeakers()
-    volume = devices.EndpointVolume
-    volume.SetMasterVolumeLevelScalar(level / 100.0, None)
-
-    return f"System volume set to {level}%."
+    # mailto opens the user's configured mail handler; it does not send the message.
+    mailto = (
+        f"mailto:{quote(recipient, safe='@')}"
+        f"?subject={quote(subject, safe='')}"
+        f"&body={quote(body, safe='')}"
+    )
+    opened = webbrowser.open(mailto)
+    if not opened:
+        return (
+            f"Prepared email details for {recipient}, but the system did not confirm "
+            "opening the default mail handler. No email was sent."
+        )
+    return (
+        f"Opened an email draft addressed to {recipient} with the supplied subject and body. "
+        "No email was sent; review and send it yourself."
+    )
