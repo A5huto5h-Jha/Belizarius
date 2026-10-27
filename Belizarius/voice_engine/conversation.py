@@ -13,6 +13,9 @@ import os
 import queue
 import threading
 import traceback
+import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -45,6 +48,8 @@ audio_queue = queue.Queue(maxsize=30)
 running = True
 callback_count = 0
 playback_generation = [0]          # Mutable counter shared with playback coroutine.
+active_speaker = [None]            # Current output stream, shared with interruption handler.
+speaker_lock = threading.Lock()
 
 
 def log(message):
@@ -57,6 +62,29 @@ def clear_audio_queue(q):
             q.get_nowait()
         except queue.Empty:
             return
+
+
+def stop_speaker_immediately():
+    """Flush the device's buffered speech without closing the conversation/mic."""
+    with speaker_lock:
+        speaker = active_speaker[0]
+        if speaker is None:
+            return
+        try:
+            # abort() discards audio already buffered by PortAudio; restart the same
+            # stream so later Gemini speech can still be played.
+            speaker.abort()
+            speaker.start()
+        except Exception as exc:
+            log(f"SPEAKER_INTERRUPT_WARNING: {type(exc).__name__}: {exc}")
+
+
+def write_audio_chunk(speaker, generation, audio_bytes):
+    """Serialize speaker writes with interruption flushes."""
+    with speaker_lock:
+        if not running or generation != playback_generation[0]:
+            return
+        speaker.write(audio_bytes)
 
 
 def audio_callback(indata, frames, time_info, status):
@@ -177,7 +205,7 @@ def tool_declarations():
         ),
         types.FunctionDeclaration(
             name="play_youtube",
-            description="Open YouTube search results for a song, artist, album, or music request. This opens search results; it does not claim a particular video has started playing.",
+            description="Find the best matching YouTube video for a song, artist, album, or music request and open that video's watch page (not just search results)." ,
             parameters={
                 "type": "OBJECT",
                 "properties": {
@@ -185,6 +213,22 @@ def tool_declarations():
                 },
                 "required": ["query"],
             },
+        ),
+        types.FunctionDeclaration(
+            name="set_volume",
+            description="Set the Windows system master volume to a percentage from 0 to 100. Use this whenever the user asks to raise, lower, mute, unmute, or set the volume.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "level": {"type": "INTEGER", "description": "Desired system volume percentage, from 0 (muted) to 100 (maximum)"}
+                },
+                "required": ["level"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="get_date_time",
+            description="Get the computer's current local date, time, and weekday. Use this for questions about today's date, the current time, or the day of the week instead of guessing.",
+            parameters={"type": "OBJECT", "properties": {}},
         ),
         types.FunctionDeclaration(
             name="compose_email",
@@ -217,7 +261,46 @@ def execute_tool(name, args):
     if name == "open_website":
         return os_tools.open_website(**args)
     if name == "play_youtube":
-        return os_tools.play_youtube(**args)
+        # Resolve a real video ID first, then open its watch page. Keep the existing
+        # os_tools integration as a fallback if yt-dlp is not installed or fails.
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return "No YouTube search query was provided."
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "yt_dlp", "--no-warnings", "--flat-playlist",
+                 "--playlist-end", "1", "--print", "id", f"ytsearch1:{query}"],
+                capture_output=True, text=True, timeout=25, check=False,
+            )
+            video_id = next(
+                (line.strip() for line in result.stdout.splitlines()
+                 if len(line.strip()) == 11 and all(ch.isalnum() or ch in "_-" for ch in line.strip())),
+                None,
+            )
+            if result.returncode == 0 and video_id:
+                video_url = f"https://www.youtube.com/watch?v={video_id}&autoplay=1"
+                opened = os_tools.open_website(url=video_url)
+                return f"Opened the YouTube video page: {video_url}. Browser autoplay may depend on browser settings. {opened}"
+        except (subprocess.TimeoutExpired, OSError, Exception) as exc:
+            log(f"YOUTUBE_RESOLUTION_FALLBACK: {type(exc).__name__}: {exc}")
+        return os_tools.play_youtube(query=query)
+    if name == "set_volume":
+        level = int(args.get("level", -1))
+        if not 0 <= level <= 100:
+            return "Volume was not changed: level must be between 0 and 100."
+        try:
+            from pycaw.pycaw import AudioUtilities
+            speakers = AudioUtilities.GetSpeakers()
+            volume = speakers.EndpointVolume
+            volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+            return f"Windows master volume set to {level}%."
+        except ImportError:
+            return "Could not change volume because pycaw is not installed. Install it with: python -m pip install pycaw comtypes"
+        except Exception as exc:
+            return f"Could not change Windows master volume: {type(exc).__name__}: {exc}"
+    if name == "get_date_time":
+        now = datetime.now().astimezone()
+        return now.strftime("Computer local date: %A, %B %d, %Y. Local time: %I:%M:%S %p %Z (UTC offset %z).")
     if name == "compose_email":
         return os_tools.compose_email(**args)
     return f"Unknown tool: {name}"
@@ -284,85 +367,100 @@ def enqueue_audio(play_queue, generation, audio_bytes):
 
 
 async def playback_worker(play_queue):
-    """Play small chunks in a separate task while the receiver remains responsive."""
+    """Play chunks while remaining interruptible; interruption flushes device audio."""
     with sd.RawOutputStream(
         samplerate=OUTPUT_RATE,
         channels=1,
         dtype="int16",
         blocksize=PLAYBACK_CHUNK_SAMPLES,
     ) as speaker:
+        active_speaker[0] = speaker
         log("SPEAKER_READY")
+        try:
+            while running:
+                try:
+                    generation, audio_bytes = await asyncio.wait_for(
+                        play_queue.get(), timeout=0.25
+                    )
+                except asyncio.TimeoutError:
+                    continue
 
-        while running:
-            try:
-                generation, audio_bytes = await asyncio.wait_for(
-                    play_queue.get(), timeout=0.25
+                if generation != playback_generation[0]:
+                    continue
+
+                await asyncio.to_thread(
+                    write_audio_chunk, speaker, generation, audio_bytes
                 )
-            except asyncio.TimeoutError:
-                continue
-
-            # Discard audio generated before the most recent interruption.
-            if generation != playback_generation[0]:
-                continue
-
-            # Write outside the event loop; the receiver can still process interruptions.
-            await asyncio.to_thread(speaker.write, audio_bytes)
+        finally:
+            active_speaker[0] = None
 
 
 async def receive_gemini_audio(session, play_queue, send_lock):
-    """Receive transcriptions, tool calls, interruptions, and generated audio."""
+    """Receive successive turns; interruptions only stop speech, never reset wake word."""
     tool_tasks = set()
 
     try:
-        async for response in session.receive():
-            if not running:
-                break
-
-            tool_call = getattr(response, "tool_call", None)
-            if tool_call:
-                task = asyncio.create_task(
-                    handle_tool_call(session, tool_call, send_lock)
-                )
-                tool_tasks.add(task)
-                task.add_done_callback(tool_tasks.discard)
-
-            content = getattr(response, "server_content", None)
-            if content is None:
-                continue
-
-            if getattr(content, "interrupted", False):
-                playback_generation[0] += 1
-                while not play_queue.empty():
-                    try:
-                        play_queue.get_nowait()
-                    except asyncio.QueueEmpty:
+        while running:
+            try:
+                async for response in session.receive():
+                    if not running:
                         break
-                log("INTERRUPTED: cleared queued speech; listening to the new turn.")
 
-            if content.input_transcription:
-                text = content.input_transcription.text
-                if text:
-                    log(f"YOU SAID: {text}")
-
-            if content.output_transcription:
-                text = content.output_transcription.text
-                if text:
-                    log(f"BELIZARIUS: {text}")
-
-            if content.model_turn:
-                for part in content.model_turn.parts:
-                    if part.inline_data and part.inline_data.data:
-                        enqueue_audio(
-                            play_queue,
-                            playback_generation[0],
-                            part.inline_data.data,
+                    tool_call = getattr(response, "tool_call", None)
+                    if tool_call:
+                        task = asyncio.create_task(
+                            handle_tool_call(session, tool_call, send_lock)
                         )
+                        tool_tasks.add(task)
+                        task.add_done_callback(tool_tasks.discard)
 
-            if content.turn_complete:
-                log("TURN_COMPLETE")
+                    content = getattr(response, "server_content", None)
+                    if content is None:
+                        continue
 
+                    if getattr(content, "interrupted", False):
+                        # This is a barge-in, not a request to end the session. Keep the
+                        # same Gemini Live session and its conversation context.
+                        playback_generation[0] += 1
+                        clear_audio_queue(play_queue)
+                        await asyncio.to_thread(stop_speaker_immediately)
+                        log("INTERRUPTED: speech stopped; conversation context retained.")
+
+                    if content.input_transcription:
+                        text = content.input_transcription.text
+                        if text:
+                            log(f"YOU SAID: {text}")
+
+                    if content.output_transcription:
+                        text = content.output_transcription.text
+                        if text:
+                            log(f"BELIZARIUS: {text}")
+
+                    if content.model_turn:
+                        for part in content.model_turn.parts:
+                            if part.inline_data and part.inline_data.data:
+                                enqueue_audio(
+                                    play_queue,
+                                    playback_generation[0],
+                                    part.inline_data.data,
+                                )
+
+                    if content.turn_complete:
+                        log("TURN_COMPLETE: session stays open and keeps listening")
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Don't drop back to wake-word mode because one receive iteration failed.
+                # Retry receiving on the current session; if the socket is irrecoverably
+                # closed, the retry message makes the actual connection issue visible.
+                log(f"GEMINI_RECEIVE_RETRY: {type(exc).__name__}: {exc}")
+                await asyncio.sleep(0.75)
+
+            # Some SDK versions end the receive iterator at a turn boundary. Re-enter it.
+            if running:
+                await asyncio.sleep(0.03)
     finally:
-        # Let already-started quick tool calls finish while the session is alive.
         if tool_tasks:
             await asyncio.gather(*list(tool_tasks), return_exceptions=True)
 
@@ -397,19 +495,35 @@ async def main():
             "You are Belizarius, a battle-hardened Roman soldier and commander, "
             "with a confident, warm, commanding voice and a subtle Latin-influenced accent. "
             "You are a conversational desktop companion, not a one-shot command processor. "
-            "Keep the conversation open and respond naturally to each user turn. "
+            "Keep the conversation open and respond naturally to each user turn. A completed "
+            "answer is not the end of the session. If you ask a clarification question, "
+            "treat the user's next utterance as the answer to that question and continue "
+            "the pending task rather than starting over. "
             "After every tool operation, always speak a concise confirmation of the actual "
             "tool result; never finish a successful task silently and never claim success "
             "unless the tool result confirms it. If a tool fails, explain the failure plainly. "
             "You may handle independent requested actions concurrently by making multiple tool "
             "calls when appropriate, and you should keep responding to new user speech while "
             "tasks are running. Briefly announce progress for lengthy work. "
-            "If the user interrupts your speech, stop the old response and address the new "
-            "request; do not cancel an already-started file operation merely because speech "
-            "was interrupted. For file creation, writing, and reading, use the supplied tools. "
+            "When the user starts speaking while you are speaking, this is a conversational "
+            "barge-in, not a command to end the session or return to wake-word mode. The audio "
+            "playback layer will stop your speech; keep listening in this same live session. "
+            "Intelligently classify the utterance using the full conversation context: if it is "
+            "a correction, answer, clarification, added constraint, or follow-up, continue the "
+            "current task with that context; if it is clearly a different request, handle it as "
+            "a new task while preserving the conversation history. If ambiguous, ask one short "
+            "clarifying question. Do not assume every interruption is a new task. Do not cancel "
+            "an already-started file operation merely because speech was interrupted. For file "
+            "creation, writing, and reading, use the supplied tools. "
             "Only access files through those tools. Deletion is disabled; do not attempt it. "
-            "For website requests, use open_website. For music requests, use play_youtube and "
-            "tell the user it opens YouTube search results rather than guaranteeing playback. "
+            "For system volume requests, always use set_volume with the requested percentage; "
+            "for requests to mute, use level 0, and for unmute use a sensible nonzero level "
+            "such as 30 if no previous level is available. Never claim volume changed unless "
+            "the tool confirms it. For today's date, current time, or weekday, always call "
+            "get_date_time rather than guessing. "
+            "For website requests, use open_website. For music requests, use play_youtube to "
+            "open the best matching YouTube video's watch page. Be honest if resolution fails "
+            "or browser autoplay is blocked. "
             "When asked to write an email to a person and their email address is not known in "
             "the current conversation, ask for that address and wait before preparing the draft. "
             "The email tool only opens a draft; it never sends email. Be clear that the user "
