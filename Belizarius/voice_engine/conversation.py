@@ -1,27 +1,83 @@
-
+import traceback
 import asyncio
 import os
 import queue
 from pathlib import Path
-
+from scipy.signal import resample_poly
 import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+import json
+import os
+import subprocess
+from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parent
+WORKSPACE = ROOT.parent / "Belizarius_Workspace"
+WORKSPACE.mkdir(exist_ok=True)
+
+def safe_path(name: str) -> Path:
+    """Allow file access only inside Belizarius_Workspace."""
+    path = (WORKSPACE / name).resolve()
+
+    if path != WORKSPACE.resolve() and WORKSPACE.resolve() not in path.parents:
+        raise ValueError("Access denied: outside Belizarius_Workspace")
+
+    return path
+
+
+def create_file(name: str, content: str = "") -> str:
+    path = safe_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return f"Created {name}"
+
+
+def read_file(name: str) -> str:
+    path = safe_path(name)
+    if not path.is_file():
+        return f"File not found: {name}"
+    return path.read_text(encoding="utf-8")[:20000]
+
+
+def write_file(name: str, content: str) -> str:
+    path = safe_path(name)
+    if not path.is_file():
+        return f"File not found: {name}. Use create_file first."
+    path.write_text(content, encoding="utf-8")
+    return f"Updated {name}"
+
+
+def delete_file(name: str) -> str:
+    path = safe_path(name)
+    if not path.is_file():
+        return f"File not found: {name}"
+    path.unlink()
+    return f"Deleted {name}"
+
+
+def open_file(name: str) -> str:
+    path = safe_path(name)
+    if not path.is_file():
+        return f"File not found: {name}"
+    os.startfile(str(path))  # Windows
+    return f"Opened {name}"
 load_dotenv(ROOT.parent / ".env")
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = "gemini-3.8-live"
 
+# Microphone capture: use the working WASAPI device.
+DEVICE_RATE = 48000
 SAMPLE_RATE_IN = 16000
-SAMPLE_RATE_OUT = 24000
-BLOCK_SIZE = 1600
+SAMPLE_RATE_OUT = 48000
+BLOCK_SIZE = 4800
 
-# Same microphone device as wake_sherpa.py
-DEVICE_ID = 1
+# Use the same working microphone device as wake_sherpa.py.
+DEVICE_ID = 21
 
 audio_queue = queue.Queue(maxsize=30)
 running = True
@@ -67,9 +123,22 @@ async def send_microphone_audio(session):
         except queue.Empty:
             continue
 
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+
+        samples_16k = resample_poly(
+            samples,
+            up=1,
+            down=3,
+        )
+
+        chunk_16k = np.clip(
+            samples_16k,
+            -32768,
+            32767,
+        ).astype(np.int16).tobytes()
         await session.send_realtime_input(
             audio=types.Blob(
-                data=chunk,
+                data=chunk_16k,
                 mime_type="audio/pcm;rate=16000",
             )
         )
@@ -91,6 +160,47 @@ async def receive_gemini_audio(session):
                 break
 
             content = response.server_content
+            tool_call = response.tool_call
+
+            if tool_call:
+                results = []
+
+                for call in tool_call.function_calls:
+                    args = dict(call.args or {})
+                    name = call.name
+
+                    try:
+                        if name == "create_file":
+                            result = create_file(**args)
+                        elif name == "read_file":
+                            result = read_file(**args)
+                        elif name == "write_file":
+                            result = write_file(**args)
+                        elif name == "open_file":
+                            result = open_file(**args)
+                        elif name == "delete_file":
+                            # Temporary safety guard: do not delete yet.
+                            result = (
+                                "Deletion is disabled until the app obtains "
+                                "explicit user confirmation."
+                            )
+                        else:
+                            result = f"Unknown tool: {name}"
+
+                    except Exception as exc:
+                        result = f"Tool failed: {type(exc).__name__}: {exc}"
+                        log(f"ERROR: {type(exc).__name__}: {exc}")
+                        traceback.print_exc()
+
+                    log(f"TOOL_RESULT: {name}: {result}")
+
+                    results.append(
+                        types.FunctionResponse(
+                            id=call.id,
+                            name=name,
+                            response={"result": result},
+                        )
+                    )
             if content is None:
                 continue
 
@@ -107,13 +217,87 @@ async def receive_gemini_audio(session):
             if content.model_turn:
                 for part in content.model_turn.parts:
                     if part.inline_data and part.inline_data.data:
-                        speaker.write(part.inline_data.data)
+                        audio_bytes = part.inline_data.data
 
+                        # Gemini Live output is typically 24 kHz PCM.
+                        samples_24k = np.frombuffer(
+                            audio_bytes, dtype=np.int16
+                        )
+
+                        # Convert 24 kHz to the speaker's 48 kHz rate.
+                        samples_48k = resample_poly(
+                            samples_24k, up=2, down=1
+                        )
+
+                        speaker.write(
+                            np.clip(samples_48k, -32768, 32767)
+                            .astype(np.int16)
+                            .tobytes()
+                        )
             if content.turn_complete:
                 log("TURN_COMPLETE")
 
 
 async def main():
+    FILE_TOOLS = [
+    types.FunctionDeclaration(
+        name="create_file",
+        description="Create a text file in the workspace with supplied content.",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING", "description": "Relative file path"},
+                "content": {"type": "STRING", "description": "Initial file content"},
+            },
+            "required": ["name", "content"],
+        },
+    ),
+    types.FunctionDeclaration(
+        name="read_file",
+        description="Read a text file from the workspace.",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING", "description": "Relative file path"},
+            },
+            "required": ["name"],
+        },
+    ),
+    types.FunctionDeclaration(
+        name="write_file",
+        description="Replace the contents of an existing workspace text file.",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING"},
+                "content": {"type": "STRING"},
+            },
+            "required": ["name", "content"],
+        },
+    ),
+    types.FunctionDeclaration(
+        name="delete_file",
+        description="Delete a file from the workspace. Only call after explicit user confirmation.",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING"},
+            },
+            "required": ["name"],
+        },
+    ),
+    types.FunctionDeclaration(
+        name="open_file",
+        description="Open a workspace file using its default Windows application.",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING"},
+            },
+            "required": ["name"],
+        },
+    ),
+]
     global running
 
     if not API_KEY or API_KEY == "PASTE_YOUR_API_KEY_HERE":
@@ -126,6 +310,13 @@ async def main():
         "response_modalities": ["AUDIO"],
         "input_audio_transcription": {},
         "output_audio_transcription": {},
+
+        # Tools belong at the TOP LEVEL of config.
+        "tools": [
+            types.Tool(function_declarations=FILE_TOOLS)
+        ],
+
+        # Keep the existing voice settings nested here.
         "speech_config": {
             "voice_config": {
                 "prebuilt_voice_config": {
@@ -133,20 +324,15 @@ async def main():
                 }
             }
         },
+
+        # Keep your full existing voice/personality prompt here.
         "system_instruction": (
             "You are Belizarius, a battle-hardened Roman soldier and commander. "
-            "Speak English with a STRONG, unmistakable Latin-influenced accent, "
-            "inspired by a Roman commander in a historical epic. The accent must "
-            "be clearly audible, not merely implied by your choice of words. "
-            "Use firm, deliberate syllables, strong consonants, rounded vowels, "
-            "slightly rolled R sounds where natural, and a measured, weighty cadence. "
-            "Avoid sounding like a native American or British English speaker. "
-            "Do not use a modern exaggerated Italian stereotype. "
-            "Your voice is deep, gravelly, masculine, stern, and commanding, "
-            "with restrained anger and occasional intimidating emphasis. "
-            "Speak as if addressing soldiers before battle. Use natural English "
-            "grammar and pronunciation; do not speak Latin unless asked. "
-            "Keep replies concise and authoritative."
+            "Speak English with a strong, deep, commanding Latin-influenced accent. "
+            "Use the available file tools when the user requests file operations. "
+            "Never claim an operation succeeded until its tool result confirms it. "
+            "Ask for explicit confirmation before deleting files. "
+            "Only access files through the supplied tools."
         ),
     }
 
@@ -161,7 +347,7 @@ async def main():
 
             # IMPORTANT: actually open the microphone.
             with sd.RawInputStream(
-                samplerate=SAMPLE_RATE_IN,
+                samplerate=DEVICE_RATE,
                 blocksize=BLOCK_SIZE,
                 device=DEVICE_ID,
                 dtype="int16",
@@ -177,46 +363,22 @@ async def main():
                 receiver = asyncio.create_task(
                     receive_gemini_audio(session)
                 )
+                try:
+                    await asyncio.gather(sender, receiver)
+                finally:
+                    running = False
 
+                    sender.cancel()
+                    receiver.cancel()
+
+                    await asyncio.gather(
+                        sender,
+                        receiver,
+                        return_exceptions=True,
+                    )
                 
-                done, pending = await asyncio.wait(
-                    [sender, receiver],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                for task in done:
-                    if task.cancelled():
-                        log(f"DEBUG_TASK_CANCELLED: {task.get_name()}")
-                    else:
-                        error = task.exception()
-                        log(f"DEBUG_TASK_FINISHED: {task.get_name()}")
-                        if error:
-                            log(f"DEBUG_TASK_ERROR: {type(error).__name__}: {error}")
-
-                running = False
-
-                for task in pending:
-                    task.cancel()
-
-                await asyncio.gather(*pending, return_exceptions=True)
-
-                for task in done:
-                    error = task.exception()
-                    if error:
-                        raise error
-
-
-                running = False
-
-                for task in pending:
-                    task.cancel()
-
-                await asyncio.gather(*pending, return_exceptions=True)
-
-                for task in done:
-                    error = task.exception()
-                    if error:
-                        raise error
+                
+                
 
     except Exception as error:
         running = False

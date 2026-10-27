@@ -12,7 +12,7 @@ MODEL = ROOT / "models" / "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 
 SAMPLE_RATE = 16000          # Rate expected by the keyword detector
 DEVICE_RATE = 48000          # Native rate supported by the tested microphone
-DEVICE_ID = 15               # AMD Audio Device (WASAPI)
+DEVICE_ID = 21               # AMD Audio Device (WASAPI)
 BLOCK_SIZE = 4800            # 100 ms at 48 kHz
 
 audio_queue = queue.Queue(maxsize=30)
