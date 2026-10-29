@@ -18,6 +18,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -41,12 +42,19 @@ DEVICE_ID = 21
 DEVICE_RATE = 48000
 INPUT_RATE = 16000
 OUTPUT_RATE = 48000
-BLOCK_SIZE = 4800                 # 100 ms at 48 kHz
-PLAYBACK_CHUNK_SAMPLES = 960      # 20 ms at 48 kHz
+# Conservative low-latency defaults; override via environment if needed.
+BLOCK_SIZE = max(480, int(os.getenv("BELIZARIUS_BLOCK_SIZE", "960")))  # 20 ms at 48 kHz
+PLAYBACK_CHUNK_SAMPLES = max(240, int(os.getenv("BELIZARIUS_PLAYBACK_CHUNK_SAMPLES", "960")))
+MIC_QUEUE_BLOCKS = max(2, int(os.getenv("BELIZARIUS_MIC_QUEUE_BLOCKS", "10")))
+PLAY_QUEUE_CHUNKS = max(5, int(os.getenv("BELIZARIUS_PLAY_QUEUE_CHUNKS", "25")))
+MAX_SESSION_RETRIES = max(0, int(os.getenv("BELIZARIUS_MAX_SESSION_RETRIES", "3")))
+RETRY_BASE_SECONDS = max(0.25, float(os.getenv("BELIZARIUS_RETRY_BASE_SECONDS", "1.0")))
+METRICS_INTERVAL_SECONDS = max(5.0, float(os.getenv("BELIZARIUS_METRICS_INTERVAL_SECONDS", "15")))
 
-audio_queue = queue.Queue(maxsize=30)
+audio_queue = queue.Queue(maxsize=MIC_QUEUE_BLOCKS)
 running = True
 callback_count = 0
+last_metrics_log = 0.0
 playback_generation = [0]          # Mutable counter shared with playback coroutine.
 active_speaker = [None]            # Current output stream, shared with interruption handler.
 speaker_lock = threading.Lock()
@@ -65,22 +73,20 @@ def clear_audio_queue(q):
 
 
 def stop_speaker_immediately():
-    """Flush the device's buffered speech without closing the conversation/mic."""
+    """Abort queued device audio; serialized against short playback writes."""
     with speaker_lock:
         speaker = active_speaker[0]
         if speaker is None:
             return
         try:
-            # abort() discards audio already buffered by PortAudio; restart the same
-            # stream so later Gemini speech can still be played.
             speaker.abort()
+            # PortAudio abort discards buffered output. Restart for later speech.
             speaker.start()
         except Exception as exc:
             log(f"SPEAKER_INTERRUPT_WARNING: {type(exc).__name__}: {exc}")
 
 
 def write_audio_chunk(speaker, generation, audio_bytes):
-    """Serialize speaker writes with interruption flushes."""
     with speaker_lock:
         if not running or generation != playback_generation[0]:
             return
@@ -88,53 +94,52 @@ def write_audio_chunk(speaker, generation, audio_bytes):
 
 
 def audio_callback(indata, frames, time_info, status):
-    """PortAudio callback: keep it short and never block on a full queue."""
-    global callback_count
-
+    """Real-time callback: no blocking I/O, expensive work, or frequent logging."""
+    global callback_count, last_metrics_log
     if status:
-        log(f"MIC_STATUS: {status}")
-
+        now = time.monotonic()
+        if now - last_metrics_log >= METRICS_INTERVAL_SECONDS:
+            last_metrics_log = now
+            log(f"MIC_STATUS: {status}")
     raw_audio = bytes(indata)
     try:
-        audio_queue.put_nowait(raw_audio)
+        audio_queue.put_nowait((time.monotonic(), raw_audio))
     except queue.Full:
         try:
             audio_queue.get_nowait()
         except queue.Empty:
             pass
         try:
-            audio_queue.put_nowait(raw_audio)
+            audio_queue.put_nowait((time.monotonic(), raw_audio))
         except queue.Full:
             pass
-
     callback_count += 1
-    if callback_count % 10 == 0:
-        samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
-        if samples.size:
-            rms = float(np.sqrt(np.mean(samples ** 2)))
-            log(f"MIC_LEVEL: {rms:.0f}")
 
 
 async def send_microphone_audio(session, send_lock):
-    """Continuously stream microphone PCM to Gemini until the session stops."""
+    """Send freshest microphone audio; report queue-to-send latency periodically."""
+    sent = 0
+    latency_total = 0.0
     while running:
         try:
-            chunk = await asyncio.to_thread(audio_queue.get, True, 0.5)
+            captured_at, chunk = await asyncio.to_thread(audio_queue.get, True, 0.5)
         except queue.Empty:
             continue
-
         samples = np.frombuffer(chunk, dtype=np.int16)
-        samples_16k = resample_poly(samples, up=1, down=3)
-        pcm_16k = np.clip(samples_16k, -32768, 32767).astype(np.int16).tobytes()
-
-        # Serialize WebSocket sends so audio chunks and tool responses do not race.
+        pcm_16k = await asyncio.to_thread(
+            lambda: np.clip(resample_poly(samples, up=1, down=3), -32768, 32767)
+            .astype(np.int16).tobytes()
+        )
+        queued_ms = max(0.0, (time.monotonic() - captured_at) * 1000)
         async with send_lock:
+            started = time.monotonic()
             await session.send_realtime_input(
-                audio=types.Blob(
-                    data=pcm_16k,
-                    mime_type="audio/pcm;rate=16000",
-                )
+                audio=types.Blob(data=pcm_16k, mime_type="audio/pcm;rate=16000")
             )
+        sent += 1
+        latency_total += queued_ms
+        if sent % 50 == 0:
+            log(f"AUDIO_METRICS: mic_queue_to_send_avg_ms={latency_total / sent:.1f}; send_ms={(time.monotonic()-started)*1000:.1f}; mic_chunks={sent}")
 
 
 def tool_declarations():
@@ -339,39 +344,42 @@ async def handle_tool_call(session, tool_call, send_lock):
         log(f"TOOL_RESPONSE_SEND_ERROR: {type(exc).__name__}: {exc}")
 
 
-def enqueue_audio(play_queue, generation, audio_bytes):
-    """Split output into small pieces so interruption latency stays low."""
+def _prepare_output_chunks(audio_bytes):
     samples = np.frombuffer(audio_bytes, dtype=np.int16)
     if samples.size == 0:
-        return
+        return []
+    samples_48k = np.clip(resample_poly(samples, up=2, down=1), -32768, 32767).astype(np.int16)
+    return [
+        samples_48k[start:start + PLAYBACK_CHUNK_SAMPLES].tobytes()
+        for start in range(0, len(samples_48k), PLAYBACK_CHUNK_SAMPLES)
+    ]
 
-    # Gemini Live generated audio is typically 24 kHz PCM; upsample to 48 kHz.
-    samples_48k = resample_poly(samples, up=2, down=1)
-    samples_48k = np.clip(samples_48k, -32768, 32767).astype(np.int16)
 
-    for start in range(0, len(samples_48k), PLAYBACK_CHUNK_SAMPLES):
-        piece = samples_48k[start:start + PLAYBACK_CHUNK_SAMPLES].tobytes()
-        item = (generation, piece)
-        try:
-            play_queue.put_nowait(item)
-        except asyncio.QueueFull:
-            # Keep recent audio rather than accumulating a long, stale response.
+async def enqueue_audio(play_queue, generation, audio_bytes):
+    # Resampling is CPU work; do not run it on the event loop.
+    # IMPORTANT: never drop arbitrary playback chunks to make room. Doing so
+    # causes audible skipped syllables/phrases even when the transcript is complete.
+    chunks = await asyncio.to_thread(_prepare_output_chunks, audio_bytes)
+    for piece in chunks:
+        while running and generation == playback_generation[0]:
             try:
-                play_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                play_queue.put_nowait(item)
-            except asyncio.QueueFull:
-                pass
+                await asyncio.wait_for(
+                    play_queue.put((generation, piece)),
+                    timeout=0.1,
+                )
+                break
+            except asyncio.TimeoutError:
+                # Backpressure is intentional: preserve speech order. If an
+                # interruption changes the generation, abandon the stale chunk.
+                continue
+        else:
+            return
 
 
 async def playback_worker(play_queue):
-    """Play chunks while remaining interruptible; interruption flushes device audio."""
+    """Keep one output stream open and reject stale-generation chunks."""
     with sd.RawOutputStream(
-        samplerate=OUTPUT_RATE,
-        channels=1,
-        dtype="int16",
+        samplerate=OUTPUT_RATE, channels=1, dtype="int16",
         blocksize=PLAYBACK_CHUNK_SAMPLES,
     ) as speaker:
         active_speaker[0] = speaker
@@ -379,87 +387,56 @@ async def playback_worker(play_queue):
         try:
             while running:
                 try:
-                    generation, audio_bytes = await asyncio.wait_for(
-                        play_queue.get(), timeout=0.25
-                    )
+                    generation, audio_bytes = await asyncio.wait_for(play_queue.get(), timeout=0.25)
                 except asyncio.TimeoutError:
                     continue
-
                 if generation != playback_generation[0]:
                     continue
-
-                await asyncio.to_thread(
-                    write_audio_chunk, speaker, generation, audio_bytes
-                )
+                await asyncio.to_thread(write_audio_chunk, speaker, generation, audio_bytes)
         finally:
             active_speaker[0] = None
 
 
 async def receive_gemini_audio(session, play_queue, send_lock):
-    """Receive successive turns; interruptions only stop speech, never reset wake word."""
+    """Receive one session. Connection errors escape to the bounded supervisor."""
     tool_tasks = set()
-
     try:
-        while running:
-            try:
-                async for response in session.receive():
-                    if not running:
-                        break
+        async for response in session.receive():
+            if not running:
+                break
+            tool_call = getattr(response, "tool_call", None)
+            if tool_call:
+                task = asyncio.create_task(handle_tool_call(session, tool_call, send_lock))
+                tool_tasks.add(task)
+                task.add_done_callback(tool_tasks.discard)
 
-                    tool_call = getattr(response, "tool_call", None)
-                    if tool_call:
-                        task = asyncio.create_task(
-                            handle_tool_call(session, tool_call, send_lock)
-                        )
-                        tool_tasks.add(task)
-                        task.add_done_callback(tool_tasks.discard)
+            content = getattr(response, "server_content", None)
+            if content is None:
+                continue
 
-                    content = getattr(response, "server_content", None)
-                    if content is None:
-                        continue
+            if getattr(content, "interrupted", False):
+                playback_generation[0] += 1
+                clear_audio_queue(play_queue)
+                await asyncio.to_thread(stop_speaker_immediately)
+                log("INTERRUPTED: playback flushed; live session retained.")
 
-                    if getattr(content, "interrupted", False):
-                        # This is a barge-in, not a request to end the session. Keep the
-                        # same Gemini Live session and its conversation context.
-                        playback_generation[0] += 1
-                        clear_audio_queue(play_queue)
-                        await asyncio.to_thread(stop_speaker_immediately)
-                        log("INTERRUPTED: speech stopped; conversation context retained.")
+            input_transcription = getattr(content, "input_transcription", None)
+            if input_transcription and getattr(input_transcription, "text", None):
+                log(f"YOU SAID: {input_transcription.text}")
+            output_transcription = getattr(content, "output_transcription", None)
+            if output_transcription and getattr(output_transcription, "text", None):
+                log(f"BELIZARIUS: {output_transcription.text}")
 
-                    if content.input_transcription:
-                        text = content.input_transcription.text
-                        if text:
-                            log(f"YOU SAID: {text}")
+            model_turn = getattr(content, "model_turn", None)
+            if model_turn:
+                generation = playback_generation[0]
+                for part in model_turn.parts:
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data and getattr(inline_data, "data", None):
+                        await enqueue_audio(play_queue, generation, inline_data.data)
 
-                    if content.output_transcription:
-                        text = content.output_transcription.text
-                        if text:
-                            log(f"BELIZARIUS: {text}")
-
-                    if content.model_turn:
-                        for part in content.model_turn.parts:
-                            if part.inline_data and part.inline_data.data:
-                                enqueue_audio(
-                                    play_queue,
-                                    playback_generation[0],
-                                    part.inline_data.data,
-                                )
-
-                    if content.turn_complete:
-                        log("TURN_COMPLETE: session stays open and keeps listening")
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Don't drop back to wake-word mode because one receive iteration failed.
-                # Retry receiving on the current session; if the socket is irrecoverably
-                # closed, the retry message makes the actual connection issue visible.
-                log(f"GEMINI_RECEIVE_RETRY: {type(exc).__name__}: {exc}")
-                await asyncio.sleep(0.75)
-
-            # Some SDK versions end the receive iterator at a turn boundary. Re-enter it.
-            if running:
-                await asyncio.sleep(0.03)
+            if getattr(content, "turn_complete", False):
+                log("TURN_COMPLETE: listening session remains active")
     finally:
         if tool_tasks:
             await asyncio.gather(*list(tool_tasks), return_exceptions=True)
@@ -467,7 +444,6 @@ async def receive_gemini_audio(session, play_queue, send_lock):
 
 async def main():
     global running, callback_count
-
     running = True
     callback_count = 0
     playback_generation[0] = 0
@@ -478,7 +454,7 @@ async def main():
         return
 
     client = genai.Client(api_key=API_KEY)
-    play_queue = asyncio.Queue(maxsize=250)
+    play_queue = asyncio.Queue(maxsize=PLAY_QUEUE_CHUNKS)
     send_lock = asyncio.Lock()
 
     config = {
@@ -532,55 +508,76 @@ async def main():
         ),
     }
 
+    playback_task = None
+    consecutive_failures = 0
     try:
-        log("CONNECTING_TO_GEMINI")
-        async with client.aio.live.connect(model=MODEL, config=config) as session:
-            log("GEMINI_CONNECTED")
+        # Keep microphone and speaker streams alive across recoverable session failures.
+        with sd.RawInputStream(
+            samplerate=DEVICE_RATE, blocksize=BLOCK_SIZE, device=DEVICE_ID,
+            dtype="int16", channels=1, callback=audio_callback,
+        ):
+            log("MICROPHONE_READY: Speak now.")
+            log("CONVERSATION_READY: Belizarius will remain listening.")
+            playback_task = asyncio.create_task(playback_worker(play_queue), name="belizarius-playback")
 
-            with sd.RawInputStream(
-                samplerate=DEVICE_RATE,
-                blocksize=BLOCK_SIZE,
-                device=DEVICE_ID,
-                dtype="int16",
-                channels=1,
-                callback=audio_callback,
-            ):
-                log("MICROPHONE_READY: Speak now.")
-                log("MIC_LEVEL should increase when you speak.")
-                log("CONVERSATION_READY: Belizarius will remain listening.")
-
-                sender = asyncio.create_task(send_microphone_audio(session, send_lock))
-                receiver = asyncio.create_task(
-                    receive_gemini_audio(session, play_queue, send_lock)
-                )
-                playback = asyncio.create_task(playback_worker(play_queue))
-                tasks = {sender, receiver, playback}
-
+            while running:
+                session_tasks = set()
+                session_started = time.monotonic()
                 try:
-                    done, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for task in done:
-                        error = task.exception()
-                        if error:
-                            raise error
-                    if receiver in done:
-                        log("GEMINI_RECEIVER_STOPPED")
+                    log("CONNECTING_TO_GEMINI")
+                    async with client.aio.live.connect(model=MODEL, config=config) as session:
+                        log("GEMINI_CONNECTED")
+                        clear_audio_queue(audio_queue)
+                        sender = asyncio.create_task(send_microphone_audio(session, send_lock), name="belizarius-mic-sender")
+                        receiver = asyncio.create_task(receive_gemini_audio(session, play_queue, send_lock), name="belizarius-gemini-receiver")
+                        session_tasks = {sender, receiver}
+                        monitored_tasks = set(session_tasks) | {playback_task}
+                        done, pending = await asyncio.wait(
+                            monitored_tasks, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if playback_task in done:
+                            error = playback_task.exception() if not playback_task.cancelled() else None
+                            raise RuntimeError(f"Playback worker stopped unexpectedly: {error or 'cancelled'}")
+                        for task in done:
+                            if task.cancelled():
+                                continue
+                            error = task.exception()
+                            if error:
+                                raise error
+                        if running:
+                            raise ConnectionError("Gemini Live session ended unexpectedly")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if time.monotonic() - session_started >= 30:
+                        consecutive_failures = 0
+                    consecutive_failures += 1
+                    log(f"GEMINI_SESSION_ERROR: {type(exc).__name__}: {exc}")
+                    if consecutive_failures > MAX_SESSION_RETRIES:
+                        log("GEMINI_RECONNECT_LIMIT_REACHED: stopping conversation engine.")
+                        break
+                    delay = min(15.0, RETRY_BASE_SECONDS * (2 ** (consecutive_failures - 1)))
+                    log(f"GEMINI_RECONNECT: attempt={consecutive_failures}/{MAX_SESSION_RETRIES}; delay_s={delay:.1f}")
+                    await asyncio.sleep(delay)
                 finally:
-                    running = False
-                    for task in tasks:
+                    for task in session_tasks:
                         if not task.done():
                             task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    if session_tasks:
+                        await asyncio.gather(*session_tasks, return_exceptions=True)
 
     except asyncio.CancelledError:
         raise
-    except Exception as error:
-        running = False
-        log(f"ERROR: {type(error).__name__}: {error}")
+    except Exception as exc:
+        log(f"ERROR: {type(exc).__name__}: {exc}")
         traceback.print_exc()
     finally:
         running = False
+        if playback_task and not playback_task.done():
+            playback_task.cancel()
+            await asyncio.gather(playback_task, return_exceptions=True)
+        clear_audio_queue(audio_queue)
+        clear_audio_queue(play_queue)
         try:
             client.close()
         except Exception:
