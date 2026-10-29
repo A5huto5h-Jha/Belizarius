@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reality Forge - Deepfake Detection</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Reality Forge</h1>
+        <p>Upload an image or video to detect potential deepfakes.</p>
+        <div class="upload-section">
+            <input type="file" id="mediaInput" accept="image/*,video/*">
+            <button onclick="analyzeMedia()">Analyze Media</button>
+        </div>
+        <div id="result" class="hidden">
+            <h2>Analysis Result:</h2>
+            <p id="statusText"></p>
+            <p id="confidenceText"></p>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
